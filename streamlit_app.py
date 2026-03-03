@@ -10,7 +10,7 @@ st.set_page_config(page_title="Social Growth Dashboard", layout="wide")
 # -----------------------------
 st.markdown("""
 <style>
-.block-container {padding-top: 2rem; padding-bottom: 2rem;}
+.block-container {padding-top: 2rem; padding-bottom: 2rem; max-width: 1400px;}
 [data-testid="stSidebar"] {background: linear-gradient(180deg, #0b1220 0%, #070b14 100%);}
 h1,h2,h3 {letter-spacing: -0.02em;}
 .small-muted {opacity: .75; font-size: 0.9rem;}
@@ -76,9 +76,6 @@ def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = new_cols
     return df
 
-# -----------------------------
-# Robust column helpers
-# -----------------------------
 def norm_cols(df: pd.DataFrame) -> dict:
     return {c.lower().strip(): c for c in df.columns}
 
@@ -124,7 +121,7 @@ def guess_export_type(df: pd.DataFrame, filename: str) -> str | None:
 # -----------------------------
 # Content parsing
 # -----------------------------
-def list_videos_from_content(period: str):
+def list_videos_from_content(period: str) -> pd.DataFrame:
     df = read_csv_safe(export_path(period, "content"))
     if df is None or df.empty:
         return pd.DataFrame()
@@ -149,14 +146,10 @@ def list_videos_from_content(period: str):
         out["comments"] = out["comments"].fillna(0)
         out.loc[out["comments"] < 0, "comments"] = 0
 
-    if out["views"].notna().any():
-        denom = out["views"].replace({0: pd.NA})
-        num = out[["likes","comments","shares"]].fillna(0).sum(axis=1)
-        out["er"] = (num / denom).fillna(0)
-        out["shares_per_1k"] = ((out["shares"].fillna(0) / denom) * 1000).fillna(0)
-    else:
-        out["er"] = 0.0
-        out["shares_per_1k"] = 0.0
+    denom = out["views"].replace({0: pd.NA}) if "views" in out.columns else pd.Series([pd.NA]*len(out))
+    num = out[["likes","comments","shares"]].fillna(0).sum(axis=1) if set(["likes","comments","shares"]).issubset(out.columns) else 0
+    out["er"] = (num / denom).fillna(0) if len(out) else 0.0
+    out["shares_per_1k"] = ((out["shares"].fillna(0) / denom) * 1000).fillna(0) if "shares" in out.columns else 0.0
 
     out["video_id"] = out.apply(lambda r: str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{r['title']}|{r['date']}")), axis=1)
     return out
@@ -205,15 +198,17 @@ def list_screenshots(video_id: str):
         return []
     return sorted([os.path.join(vdir, x) for x in os.listdir(vdir)])
 
+# -----------------------------
+# Scoring (DO NOT return er/shares_per_1k -> avoids column collisions)
+# -----------------------------
 def compute_growth_score(row, vstate: dict):
     duration = vstate.get("duration_sec") or None
     avg_watch = vstate.get("avg_watch_sec") or None
     completion = vstate.get("completion_pct") or None
     followers_gained = vstate.get("followers_gained") or None
 
-    views = row.get("views")
-    shares_per_1k = row.get("shares_per_1k", 0.0)
-    er = row.get("er", 0.0)
+    views = row.get("views") or 0
+    shares_per_1k = row.get("shares_per_1k", 0.0) or 0.0
 
     retention = None
     if duration and avg_watch and duration > 0:
@@ -229,13 +224,7 @@ def compute_growth_score(row, vstate: dict):
     follow_score = (float(follow_per_1k) / 10.0 if follow_per_1k is not None else 0.0) * 10
 
     score = retention_score + completion_score + share_score + follow_score
-    return {
-        "retention": retention,
-        "follow_per_1k": follow_per_1k,
-        "score": score,
-        "er": er,
-        "shares_per_1k": shares_per_1k,
-    }
+    return {"retention": retention, "follow_per_1k": follow_per_1k, "score": score}
 
 # -----------------------------
 # Sidebar navigation
@@ -373,7 +362,7 @@ def page_growth_cockpit():
     total_shares   = sum_num(o, shares_col)
 
     profile_ctr = (total_profile / total_views) if total_views else 0
-    er = ((total_likes + total_comments + total_shares) / total_views) if total_views else 0
+    er_total = ((total_likes + total_comments + total_shares) / total_views) if total_views else 0
     shares_per_1k = (total_shares / total_views) * 1000 if total_views else 0
 
     follow_per_1k_list = []
@@ -394,7 +383,7 @@ def page_growth_cockpit():
     a, b, cc, d, e, f = st.columns(6)
     a.metric("Views", f"{int(total_views):,}".replace(",", "."))
     b.metric("Profile CTR", f"{profile_ctr*100:.2f}%")
-    cc.metric("Engagement", f"{er*100:.2f}%")
+    cc.metric("Engagement", f"{er_total*100:.2f}%")
     d.metric("Shares / 1K", f"{shares_per_1k:.2f}")
     e.metric("Follow / 1K", "-" if avg_follow_per_1k is None else f"{avg_follow_per_1k:.2f}")
     f.metric("Completion %", "-" if avg_completion is None else f"{avg_completion:.1f}")
@@ -426,7 +415,9 @@ def page_content():
         vs = load_video_state(row["video_id"])
         scores.append(compute_growth_score(row, vs))
     s = pd.DataFrame(scores)
+    s = make_unique_columns(s)
     df2 = pd.concat([df.reset_index(drop=True), s.reset_index(drop=True)], axis=1)
+    df2 = make_unique_columns(df2)
 
     with st.expander("Filtreler", expanded=False):
         min_views = st.number_input("Min Views", value=0)
@@ -437,11 +428,11 @@ def page_content():
     df2 = df2[df2["views"].fillna(0) >= min_views].copy()
     df2 = df2.sort_values(sort_by, ascending=False)
 
-    # KPI strip
-    total_videos = len(df2)
-    total_views = int(df2["views"].fillna(0).sum()) if "views" in df2.columns else 0
-    avg_er = float(df2["er"].fillna(0).mean()) if "er" in df2.columns else 0
-    avg_shares_1k = float(df2["shares_per_1k"].fillna(0).mean()) if "shares_per_1k" in df2.columns else 0
+    # KPIs (safe: enforce Series)
+    total_videos = int(len(df2))
+    total_views = int(pd.to_numeric(df2["views"], errors="coerce").fillna(0).sum()) if "views" in df2.columns else 0
+    avg_er = float(pd.to_numeric(df2["er"], errors="coerce").fillna(0).mean()) if "er" in df2.columns else 0.0
+    avg_shares_1k = float(pd.to_numeric(df2["shares_per_1k"], errors="coerce").fillna(0).mean()) if "shares_per_1k" in df2.columns else 0.0
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Video sayısı", f"{total_videos}")
@@ -459,17 +450,19 @@ def page_content():
     with cA:
         st.subheader("En çok izlenenler")
         chart_df = top[["title_short", "views"]].copy().rename(columns={"title_short": "Video"})
+        chart_df["views"] = pd.to_numeric(chart_df["views"], errors="coerce").fillna(0)
         st.bar_chart(chart_df.set_index("Video"))
 
     with cB:
         st.subheader("En çok paylaşılanlar (1K başına)")
         chart_df = top[["title_short", "shares_per_1k"]].copy().rename(columns={"title_short": "Video"})
+        chart_df["shares_per_1k"] = pd.to_numeric(chart_df["shares_per_1k"], errors="coerce").fillna(0)
         st.bar_chart(chart_df.set_index("Video"))
 
     cC, cD = st.columns(2)
     with cC:
         st.subheader("ER dağılımı")
-        hist = df2["er"].fillna(0).copy()
+        hist = pd.to_numeric(df2["er"], errors="coerce").fillna(0)
         bins = pd.cut(hist, bins=[0,0.01,0.02,0.03,0.05,0.08,1.0], include_lowest=True)
         hist_df = bins.value_counts().sort_index().reset_index()
         hist_df.columns = ["ER bandı", "Video sayısı"]
@@ -478,18 +471,18 @@ def page_content():
     with cD:
         st.subheader("Score vs Views")
         scatter = df2[["views","score"]].copy()
-        scatter["views"] = scatter["views"].fillna(0)
-        scatter["score"] = scatter["score"].fillna(0)
+        scatter["views"] = pd.to_numeric(scatter["views"], errors="coerce").fillna(0)
+        scatter["score"] = pd.to_numeric(scatter["score"], errors="coerce").fillna(0)
         st.scatter_chart(scatter, x="views", y="score")
 
     st.divider()
 
-    # Pick a video and show an inline "detail card" with SS upload
     st.subheader("Video seç ve SS yükle (video bazlı)")
     pick = st.selectbox(
         "Video",
         df2["video_id"].tolist(),
-        format_func=lambda vid: df2.loc[df2["video_id"]==vid,"title"].iloc[0]
+        format_func=lambda vid: df2.loc[df2["video_id"]==vid,"title"].iloc[0],
+        key="pick_video"
     )
 
     if pick:
@@ -502,9 +495,9 @@ def page_content():
             st.markdown(f"### {row['title']}")
             st.markdown(f"<div class='small-muted'>Tarih: {row.get('date','')} | Video ID: <code>{pick}</code></div>", unsafe_allow_html=True)
         with right:
-            st.metric("Views", f"{int((row.get('views') or 0)):,}".replace(",", "."))
-            st.metric("ER", f"{float(row.get('er') or 0)*100:.2f}%")
-            st.metric("Shares/1K", f"{float(row.get('shares_per_1k') or 0):.2f}")
+            st.metric("Views", f"{int((pd.to_numeric(pd.Series([row.get('views')]), errors='coerce').fillna(0).iloc[0])):,}".replace(",", "."))
+            st.metric("ER", f"{float(pd.to_numeric(pd.Series([row.get('er')]), errors='coerce').fillna(0).iloc[0])*100):.2f}%")
+            st.metric("Shares/1K", f"{float(pd.to_numeric(pd.Series([row.get('shares_per_1k')]), errors='coerce').fillna(0).iloc[0])):.2f}")
         st.markdown("</div>", unsafe_allow_html=True)
 
         with st.expander("📌 Bu videonun Analytics SS'lerini yükle", expanded=True):
@@ -512,7 +505,7 @@ def page_content():
                 "SS seç (birden fazla)",
                 type=["png","jpg","jpeg","webp"],
                 accept_multiple_files=True,
-                key=f"ss_uploader_inline_{pick}"
+                key=f"ss_uploader_{pick}"
             )
             if ss_files:
                 saved = save_screenshots(pick, ss_files)
@@ -524,7 +517,7 @@ def page_content():
                 for p in shots[-6:]:
                     st.image(p, use_container_width=True)
 
-        st.caption("Daha detaylı metrik girmek için: aşağıdaki Video Detay alanını kullan.")
+        st.caption("Daha detaylı metrik girmek için aşağıdaki Video Detay alanını kullan.")
         st.divider()
         st.subheader("Video Detay")
         page_video_detail()
@@ -545,7 +538,6 @@ def page_video_detail():
     state = load_video_state(vid)
     st.markdown(f"**Video ID:** `{vid}`")
 
-    # SS list (already uploaded)
     shots = list_screenshots(vid)
     if shots:
         with st.expander("Yüklenen SS’ler", expanded=False):
@@ -579,20 +571,20 @@ def page_video_detail():
     st.subheader("Otomatik ilk teşhis (kural tabanlı)")
 
     df = list_videos_from_content(period)
-    row = df[df["video_id"]==vid].iloc[0].to_dict() if not df.empty else {"views": None, "er": 0.0, "shares_per_1k": 0.0}
+    row = df[df["video_id"]==vid].iloc[0].to_dict() if not df.empty else {"views": 0, "shares_per_1k": 0.0}
     res = compute_growth_score(row, state)
 
     colA, colB, colC = st.columns(3)
-    colA.metric("Score", f"{res['score']:.1f}")
-    colB.metric("Retention", "-" if res["retention"] is None else f"{res['retention']*100:.1f}%")
-    colC.metric("Follow / 1K", "-" if res["follow_per_1k"] is None else f"{res['follow_per_1k']:.2f}")
+    colA.metric("Score", f"{float(res['score']):.1f}")
+    colB.metric("Retention", "-" if res["retention"] is None else f"{float(res['retention'])*100:.1f}%")
+    colC.metric("Follow / 1K", "-" if res["follow_per_1k"] is None else f"{float(res['follow_per_1k']):.2f}")
 
     verdicts = []
     if res["retention"] is not None and res["retention"] < 0.35:
         verdicts.append("Hook/tempo tırt: izleyici videoda kalmıyor. İlk 2 saniyeyi sertleştir.")
     if state.get("completion_pct") is not None and float(state["completion_pct"]) < 20:
         verdicts.append("Completion düşük: video gereksiz uzuyor veya payoff geç geliyor.")
-    if row.get("shares_per_1k", 0) < 3:
+    if float(row.get("shares_per_1k", 0) or 0) < 3:
         verdicts.append("Paylaşım zayıf: bilgi içeriğini ‘kopyala-yapıştır değer’ gibi paketle, daha keskin başlık.")
     if not verdicts:
         verdicts.append("Sinyaller fena değil: aynı formatı 3 varyasyonla tekrar dene (hook değiştir, tempo sabit).")
@@ -610,6 +602,7 @@ def page_viewers():
 
 def page_followers():
     st.title("Takipçiler")
+
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Follower History")
@@ -618,6 +611,7 @@ def page_followers():
             st.info("FollowerHistory yok.")
         else:
             st.dataframe(make_unique_columns(df.copy()), use_container_width=True)
+
     with c2:
         st.subheader("Follower Activity")
         df = read_csv_safe(export_path(period, "follower_activity"))
